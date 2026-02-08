@@ -5,7 +5,7 @@ import { setConfig } from "./config";
 import { seedDefaultAgents, upsertAgent, getSystemPrompt } from "./agents";
 import { c, g, Spinner, formatDuration } from "./format";
 
-interface BenchmarkResult {
+export interface BenchmarkResult {
   endpoint: DiscoveredEndpoint;
   model: string;
   provider: "ollama" | "openai";
@@ -17,7 +17,7 @@ interface BenchmarkResult {
   skipped?: boolean;
 }
 
-const TEST_PROMPT: ChatMessage[] = [
+export const TEST_PROMPT: ChatMessage[] = [
   { role: "system", content: "Answer in one short sentence." },
   { role: "user", content: "What is the capital of France?" },
 ];
@@ -30,13 +30,13 @@ const OOM_PATTERNS = [
   "not enough memory",
 ];
 
-function isOomError(error: string): boolean {
+export function isOomError(error: string): boolean {
   const lower = error.toLowerCase();
   return OOM_PATTERNS.some((p) => lower.includes(p.toLowerCase()));
 }
 
 // Pick one representative model per endpoint: smallest for Ollama, first for OpenAI
-function pickTestModel(ep: DiscoveredEndpoint): string | null {
+export function pickTestModel(ep: DiscoveredEndpoint): string | null {
   if (ep.models.length === 0) return null;
   if (ep.type === "openai") return ep.models[0];
   // For Ollama, models are listed - just pick the first (they're returned in order)
@@ -44,7 +44,7 @@ function pickTestModel(ep: DiscoveredEndpoint): string | null {
   return ep.models[0];
 }
 
-async function benchmarkModel(
+export async function benchmarkModel(
   provider: "ollama" | "openai",
   endpoint: string,
   model: string
