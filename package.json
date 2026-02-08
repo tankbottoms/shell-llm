@@ -1,0 +1,23 @@
+{
+  "name": "shellm",
+  "version": "0.1.0",
+  "description": "Quick LLM chat for the terminal - Ollama & vLLM",
+  "type": "module",
+  "main": "src/index.ts",
+  "bin": {
+    "shellm": "src/index.ts"
+  },
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "build": "bun build src/index.ts --compile --outfile dist/shellm",
+    "build:macos": "bun build src/index.ts --compile --target=bun-darwin-arm64 --outfile dist/shellm-macos-arm64",
+    "build:linux-arm": "bun build src/index.ts --compile --target=bun-linux-arm64 --outfile dist/shellm-linux-arm64",
+    "build:linux-x64": "bun build src/index.ts --compile --target=bun-linux-x64 --outfile dist/shellm-linux-x64",
+    "build:all": "bun run build:macos && bun run build:linux-arm && bun run build:linux-x64",
+    "install:local": "bash scripts/install.sh"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
