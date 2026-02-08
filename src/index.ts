@@ -67,7 +67,6 @@ function parseArgs(argv: string[]): ParsedArgs {
 }
 
 function printHelp(): void {
-  const gl = g();
   console.log(`\n${banner()}\n`);
   console.log(`${c.bold}USAGE:${c.reset}`);
   console.log(`  shellm [command] [options]`);
@@ -143,7 +142,7 @@ async function cmdModels(): Promise<void> {
   const endpoints = enumerateEndpoints();
   const results = await discoverAll(endpoints);
   const gl = g();
-  console.log(`\n${c.bold}${gl.server} Available Models${c.reset}\n`);
+  console.log(`\n${c.bold}${gl.server}  Available Models${c.reset}\n`);
 
   for (const ep of results) {
     if (!ep.available) {
