@@ -3,11 +3,12 @@ import {
   getConfig,
   setConfig,
   enumerateEndpoints,
+  writeEnvAgents,
 } from "../config";
 import { discoverAll, printDiscovery, type DiscoveredEndpoint } from "../llm/discovery";
 import { seedDefaultAgents, listAgents, upsertAgent, getSystemPrompt } from "../agents";
 import { benchmarkModel, pickTestModel, isOomError, TEST_PROMPT } from "../benchmark";
-import { ask, confirm, select } from "./prompts";
+import { ask, confirm, select, arrowSelect, type ArrowOption } from "./prompts";
 
 interface ModelOption {
   model: string;
@@ -18,6 +19,8 @@ interface ModelOption {
   tokPerSec?: number;
   tested: boolean;
 }
+
+// ── Main Config Wizard ──────────────────────────────────────────
 
 export async function runConfigWizard(firstRun = false): Promise<void> {
   const gl = g();
@@ -137,19 +140,19 @@ export async function runConfigWizard(firstRun = false): Promise<void> {
   // Sort by speed (fastest first)
   results.sort((a, b) => (a.durationMs || Infinity) - (b.durationMs || Infinity));
 
-  // ── Step 3: Auto-assign agents ──────────────────────────────
+  // ── Step 3: Assign models to agents ───────────────────────
   console.log(`\n${c.bold}Step 3/3: Assigning models to agents${c.reset}\n`);
 
   const fastest = results[0];
   const slowest = results.length > 1 ? results[results.length - 1] : fastest;
   const middle = results.length > 2 ? results[1] : fastest;
 
-  // Build agent assignments
+  // Build proposed auto-assignments
   const assignments: {
     id: string; name: string; shorthand: string; role: string;
     model: string; endpoint: string; endpointName: string;
     provider: "ollama" | "openai"; isDefault: boolean;
-    durationMs?: number; tokPerSec?: number; tested?: boolean;
+    durationMs?: number; tokPerSec?: number;
   }[] = [
     {
       id: "general", name: "General Assistant", shorthand: "g", role: "general",
@@ -169,7 +172,6 @@ export async function runConfigWizard(firstRun = false): Promise<void> {
     },
   ];
 
-  // Only add thinking/worker if we have multiple distinct endpoints
   if (results.length > 1) {
     assignments.push({
       id: "thinking", name: `Deep Thinking (${slowest.model})`, shorthand: "t", role: "thinking",
@@ -190,10 +192,10 @@ export async function runConfigWizard(firstRun = false): Promise<void> {
     const def = a.isDefault ? ` ${c.yellow}(default)${c.reset}` : "";
     const speed = a.durationMs ? ` ${c.dim}(${formatDuration(a.durationMs)})${c.reset}` : "";
     console.log(
-      `  ${c.cyan}${a.shorthand}${c.reset} ${c.bold}${a.name}${c.reset}${def}`
+      `  ${agentIcon(a.id)} ${c.bold}${a.name}${c.reset}${def}`
     );
     console.log(
-      `    ${c.dim}${a.provider}://${a.endpoint} | model: ${a.model}${c.reset}${speed}`
+      `    ${c.cyan}${a.model}${c.reset} ${c.dim}on ${a.endpointName}${c.reset}${speed}`
     );
   }
 
@@ -201,35 +203,38 @@ export async function runConfigWizard(firstRun = false): Promise<void> {
   const acceptAll = await confirm("Accept this configuration?", true);
 
   if (acceptAll) {
-    // Apply all assignments
-    setConfig("default_model", fastest.model);
-    for (const a of assignments) {
-      upsertAgent({
-        id: a.id, name: a.name, shorthand: a.shorthand,
-        provider: a.provider, endpoint: a.endpoint, model: a.model,
-        systemPrompt: getSystemPrompt(a.role),
-        isDefault: a.isDefault,
-      });
-    }
+    applyAssignments(assignments);
   } else {
-    // Let user customize each agent
-    console.log(`\n${c.bold}Customize each agent:${c.reset}\n`);
-    console.log(`${c.dim}For each agent, pick a model or press Enter to accept the suggestion.${c.reset}\n`);
+    // Let user customize each agent with arrow-key selection
+    console.log(`\n${c.bold}Customize each agent:${c.reset}`);
+    console.log(`${c.dim}Use arrow keys to select a model for each agent.${c.reset}`);
+    console.log(`${c.dim}Fastest models are highlighted at the top.${c.reset}\n`);
 
-    // Build numbered model list
-    const allModels = buildModelList(online);
-
-    setConfig("default_model", fastest.model);
+    const modelOptions = buildArrowOptions(results);
 
     for (const a of assignments) {
-      const chosen = await pickModelForAgent(a.name, a.model, a.endpointName, allModels);
-      upsertAgent({
-        id: a.id, name: a.name, shorthand: a.shorthand,
-        provider: chosen.provider, endpoint: chosen.endpoint, model: chosen.model,
-        systemPrompt: getSystemPrompt(a.role),
-        isDefault: a.isDefault,
-      });
+      // Pre-select the auto-assigned model
+      const defaultIdx = modelOptions.findIndex(
+        (o) => o.value === `${a.model}||${a.endpoint}||${a.provider}`
+      );
+
+      console.log(`${hr("─", 50)}`);
+      console.log(`\n  ${agentIcon(a.id)} ${c.bold}${a.name}${c.reset}${a.isDefault ? ` ${c.yellow}(default)${c.reset}` : ""}`);
+
+      const { value } = await arrowSelect(
+        `Model for ${a.name}:`,
+        modelOptions,
+        Math.max(0, defaultIdx),
+      );
+
+      const parsed = parseModelValue(value);
+      a.model = parsed.model;
+      a.endpoint = parsed.endpoint;
+      a.provider = parsed.provider;
+      a.endpointName = modelOptions.find((o) => o.value === value)?.dimLabel?.replace(/^on /, "").replace(/ \(.*/, "") || a.endpointName;
     }
+
+    applyAssignments(assignments);
   }
 
   // Settings
@@ -239,6 +244,66 @@ export async function runConfigWizard(firstRun = false): Promise<void> {
   console.log(successMsg("Configuration complete."));
   showFinalConfig();
 }
+
+// ── Customize Agents (arrow-key selection) ──────────────────
+
+async function customizeAgents(): Promise<void> {
+  const gl = g();
+  console.log(`\n${c.bold}${gl.robot} Customize Agent Models${c.reset}\n`);
+  console.log(`${c.dim}Use arrow keys to pick a model for each agent.${c.reset}`);
+  console.log(`${c.dim}Fastest responding models are highlighted at the top.${c.reset}\n`);
+
+  // Discover what's available
+  const endpoints = enumerateEndpoints();
+  const discovered = await discoverAll(endpoints);
+  const online = discovered.filter((d) => d.available);
+
+  if (online.length === 0) {
+    console.log(errorMsg("No endpoints available."));
+    return;
+  }
+
+  // Quick latency test to sort models
+  const modelInfos = collectModels(online);
+  const tested = await measureLatency(modelInfos);
+  const modelOptions = buildArrowOptions(tested);
+
+  const agents = listAgents();
+  const updatedAgents: { id: string; model: string; endpoint: string; provider: string }[] = [];
+
+  for (const agent of agents) {
+    const currentVal = `${agent.model}||${agent.endpoint}||${agent.provider}`;
+    const defaultIdx = modelOptions.findIndex((o) => o.value === currentVal);
+
+    console.log(`${hr("─", 50)}`);
+    console.log(`\n  ${agentIcon(agent.id)} ${c.bold}${agent.name}${c.reset} ${c.dim}[${agent.shorthand}]${c.reset}`);
+    console.log(`  ${c.dim}current: ${agent.model} on ${agent.endpoint}${c.reset}`);
+
+    const { value } = await arrowSelect(
+      `Model for ${agent.name}:`,
+      modelOptions,
+      Math.max(0, defaultIdx),
+    );
+
+    const parsed = parseModelValue(value);
+    upsertAgent({
+      ...agent,
+      provider: parsed.provider,
+      endpoint: parsed.endpoint,
+      model: parsed.model,
+    });
+
+    updatedAgents.push({ id: agent.id, ...parsed });
+  }
+
+  // Persist to .env
+  writeEnvAgents(updatedAgents);
+
+  console.log(`\n${successMsg("Agents updated.")}`);
+  showFinalConfig();
+}
+
+// ── Settings ────────────────────────────────────────────────
 
 async function configureSettings(): Promise<void> {
   const cfg = getConfig();
@@ -254,42 +319,7 @@ async function configureSettings(): Promise<void> {
   setConfig("stream", stream ? "true" : "false");
 }
 
-async function customizeAgents(): Promise<void> {
-  const gl = g();
-  console.log(`\n${c.bold}${gl.robot} Customize Agent Models${c.reset}\n`);
-  console.log(`${c.dim}Pick a model for each agent. Press Enter to keep current.${c.reset}\n`);
-
-  // Discover what's available
-  const endpoints = enumerateEndpoints();
-  const discovered = await discoverAll(endpoints);
-  const online = discovered.filter((d) => d.available);
-
-  if (online.length === 0) {
-    console.log(errorMsg("No endpoints available."));
-    return;
-  }
-
-  const allModels = buildModelList(online);
-  const agents = listAgents();
-
-  for (const agent of agents) {
-    const chosen = await pickModelForAgent(
-      `${agent.name} [${agent.shorthand}]`,
-      agent.model,
-      agent.endpoint,
-      allModels
-    );
-    upsertAgent({
-      ...agent,
-      provider: chosen.provider,
-      endpoint: chosen.endpoint,
-      model: chosen.model,
-    });
-  }
-
-  console.log(`\n${successMsg("Agents updated.")}`);
-  showFinalConfig();
-}
+// ── Reset Agents ────────────────────────────────────────────
 
 async function resetAgents(): Promise<void> {
   console.log(`\n${c.dim}Discovering endpoints for reset...${c.reset}`);
@@ -302,69 +332,159 @@ async function resetAgents(): Promise<void> {
     return;
   }
 
-  // Use first available model on first endpoint
   const ep = online[0];
   const model = ep.models[0] || "unknown";
 
   seedDefaultAgents(ep.url, model, ep.type);
   setConfig("default_model", model);
 
+  // Persist defaults to .env
+  const agents = listAgents();
+  writeEnvAgents(agents.map((a) => ({
+    id: a.id, model: a.model, endpoint: a.endpoint, provider: a.provider,
+  })));
+
   console.log(successMsg(`\nReset all agents to ${model} on ${ep.name}.`));
   console.log(`${c.dim}Run 'shellm config' again and choose "Re-run setup" for benchmarked assignment.${c.reset}`);
   showFinalConfig();
 }
 
-interface ModelChoice {
-  model: string;
-  endpoint: string;
-  provider: "ollama" | "openai";
+// ── Helpers ─────────────────────────────────────────────────
+
+function applyAssignments(assignments: {
+  id: string; name: string; shorthand: string; role: string;
+  model: string; endpoint: string; provider: "ollama" | "openai";
+  isDefault: boolean;
+}[]): void {
+  const generalCfg = assignments.find((a) => a.id === "general") || assignments[0];
+  setConfig("default_model", generalCfg.model);
+
+  for (const a of assignments) {
+    upsertAgent({
+      id: a.id, name: a.name, shorthand: a.shorthand,
+      provider: a.provider, endpoint: a.endpoint, model: a.model,
+      systemPrompt: getSystemPrompt(a.role),
+      isDefault: a.isDefault,
+    });
+  }
+
+  // Persist to .env
+  writeEnvAgents(
+    assignments.map((a) => ({
+      id: a.id, model: a.model, endpoint: a.endpoint, provider: a.provider,
+    }))
+  );
 }
 
-function buildModelList(online: DiscoveredEndpoint[]): (ModelChoice & { label: string })[] {
-  const list: (ModelChoice & { label: string })[] = [];
+function collectModels(online: DiscoveredEndpoint[]): ModelOption[] {
+  const models: ModelOption[] = [];
   for (const ep of online) {
     for (const model of ep.models) {
-      list.push({
+      models.push({
         model,
         endpoint: ep.url,
+        endpointName: ep.name,
         provider: ep.type,
-        label: `${model} on ${ep.name} (${ep.url})`,
+        tested: false,
       });
     }
   }
-  return list;
+  return models;
 }
 
-async function pickModelForAgent(
-  agentLabel: string,
-  currentModel: string,
-  currentEndpoint: string,
-  allModels: (ModelChoice & { label: string })[]
-): Promise<ModelChoice> {
-  console.log(`\n${c.cyan}${g().arrow}${c.reset} ${c.bold}${agentLabel}${c.reset}`);
-  console.log(`  ${c.dim}current: ${currentModel} (${currentEndpoint})${c.reset}`);
-  console.log();
+async function measureLatency(models: ModelOption[]): Promise<ModelOption[]> {
+  const gl = g();
+  console.log(`\n${c.bold}${gl.bolt} Measuring response latency...${c.reset}\n`);
 
-  for (let i = 0; i < allModels.length; i++) {
-    const m = allModels[i];
-    const current = m.model === currentModel && m.endpoint === currentEndpoint;
-    const marker = current ? ` ${c.yellow}<-- current${c.reset}` : "";
-    console.log(`  ${c.bold}${i + 1}${c.reset}. ${m.label}${marker}`);
+  for (const m of models) {
+    const label = `${m.model} ${c.dim}on ${m.endpointName}${c.reset}`;
+    process.stderr.write(`  ${c.dim}${gl.clock} testing ${label}...${c.reset}\x1b[K`);
+
+    try {
+      const bench = await benchmarkModel(m.provider, m.endpoint, m.model);
+      if (bench.success) {
+        m.durationMs = bench.durationMs;
+        m.tokPerSec = bench.tokensOut > 0 && bench.durationMs > 0
+          ? (bench.tokensOut / bench.durationMs) * 1000 : 0;
+        m.tested = true;
+        process.stderr.write(
+          `\r  ${c.green}${gl.check}${c.reset} ${label} ${c.cyan}${formatDuration(bench.durationMs)}${c.reset}\x1b[K\n`
+        );
+      } else {
+        process.stderr.write(
+          `\r  ${c.red}${gl.cross}${c.reset} ${label} ${c.dim}${bench.error || "no response"}${c.reset}\x1b[K\n`
+        );
+      }
+    } catch {
+      process.stderr.write(
+        `\r  ${c.red}${gl.cross}${c.reset} ${label} ${c.dim}failed${c.reset}\x1b[K\n`
+      );
+    }
   }
 
-  const answer = await ask(`  Select model`, "");
-  if (!answer) {
-    // Keep current
-    const existing = allModels.find(m => m.model === currentModel && m.endpoint === currentEndpoint);
-    return existing || allModels[0];
-  }
+  // Sort: tested models by latency (fastest first), untested at end
+  models.sort((a, b) => {
+    if (!a.tested && !b.tested) return 0;
+    if (!a.tested) return 1;
+    if (!b.tested) return -1;
+    return (a.durationMs || Infinity) - (b.durationMs || Infinity);
+  });
 
-  const idx = parseInt(answer) - 1;
-  if (idx >= 0 && idx < allModels.length) {
-    return allModels[idx];
-  }
-  return allModels[0];
+  return models;
 }
+
+/**
+ * Build arrow-select options from model list.
+ * Fastest model gets a bolt badge.
+ */
+function buildArrowOptions(models: ModelOption[]): ArrowOption[] {
+  const options: ArrowOption[] = [];
+  let fastestFound = false;
+
+  for (const m of models) {
+    const latencyStr = m.durationMs !== undefined
+      ? formatDuration(m.durationMs)
+      : "not tested";
+    const speedStr = m.tokPerSec && m.tokPerSec > 0
+      ? ` ${m.tokPerSec.toFixed(1)} tok/s`
+      : "";
+
+    let badge = "";
+    if (m.tested && !fastestFound) {
+      badge = `${g().bolt} fastest`;
+      fastestFound = true;
+    }
+
+    options.push({
+      label: m.model,
+      value: `${m.model}||${m.endpoint}||${m.provider}`,
+      dimLabel: `on ${m.endpointName} (${latencyStr}${speedStr})`,
+      badge,
+    });
+  }
+
+  return options;
+}
+
+function parseModelValue(val: string): { model: string; endpoint: string; provider: "ollama" | "openai" } {
+  const [model, endpoint, provider] = val.split("||");
+  return { model, endpoint, provider: provider as "ollama" | "openai" };
+}
+
+function agentIcon(id: string): string {
+  const gl = g();
+  const icons: Record<string, string> = {
+    general: `${c.cyan}${gl.chat}${c.reset}`,
+    coding: `${c.green}${gl.code}${c.reset}`,
+    research: `${c.yellow}${gl.search}${c.reset}`,
+    thinking: `${c.magenta}${gl.brain}${c.reset}`,
+    docs: `${c.blue}${gl.doc}${c.reset}`,
+    worker: `${c.white}${gl.terminal}${c.reset}`,
+  };
+  return icons[id] || `${c.white}${gl.robot}${c.reset}`;
+}
+
+// ── Display ─────────────────────────────────────────────────
 
 function showCurrentConfig(): void {
   const cfg = getConfig();
@@ -379,7 +499,9 @@ function showCurrentConfig(): void {
     console.log(`  ${gl.robot} ${c.bold}Agents:${c.reset}`);
     for (const a of agents) {
       const def = a.isDefault ? " *" : "";
-      console.log(`    ${c.cyan}[${a.shorthand}]${c.reset} ${a.name}${def} ${c.dim}(${a.model} on ${a.endpoint})${c.reset}`);
+      console.log(
+        `    ${c.cyan}[${a.shorthand}]${c.reset} ${a.name}${def} ${c.dim}${a.model} on ${a.endpoint}${c.reset}`
+      );
     }
   }
 }
@@ -391,11 +513,13 @@ function showFinalConfig(): void {
   for (const a of agents) {
     const def = a.isDefault ? ` ${c.yellow}(default)${c.reset}` : "";
     console.log(
-      `  ${c.cyan}${a.shorthand}${c.reset} ${c.bold}${a.name}${c.reset}${def}`
+      `  ${agentIcon(a.id)} ${c.bold}${a.name}${c.reset}${def}`
     );
     console.log(
-      `    ${c.dim}${a.provider}://${a.endpoint} | model: ${a.model}${c.reset}`
+      `    ${c.cyan}${a.model}${c.reset} ${c.dim}on ${a.endpoint} (${a.provider})${c.reset}`
     );
   }
-  console.log(`\n${c.dim}Data stored in: ${getConfig().dataDir}${c.reset}\n`);
+  console.log(`\n${c.dim}Agent-model mapping saved to .env and database.${c.reset}`);
+  console.log(`${c.dim}Edit .env SHELLM_AGENT_* vars or run 'shellm config' to change.${c.reset}`);
+  console.log(`${c.dim}Data stored in: ${getConfig().dataDir}${c.reset}\n`);
 }

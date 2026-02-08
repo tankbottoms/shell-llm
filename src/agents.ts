@@ -1,4 +1,5 @@
 import { getDb } from "./db";
+import { loadAgentConfigsFromEnv } from "./config";
 
 export interface Agent {
   id: string;
@@ -21,6 +22,22 @@ const SYSTEM_PROMPTS: Record<string, string> = {
   thinking: `You are a deep thinking assistant. Take your time to reason through problems carefully. Break down complex topics into understandable parts. Show your reasoning process. Consider edge cases and implications.`,
 
   docs: `You are a documentation specialist. Provide clear, well-structured explanations. Use examples liberally. Format output with headers, lists, and code blocks for readability. Focus on accuracy and completeness.`,
+};
+
+const AGENT_NAMES: Record<string, string> = {
+  general: "General Assistant",
+  coding: "Coding Assistant",
+  research: "Research / Thinking",
+  thinking: "Deep Thinking",
+  docs: "Documentation",
+};
+
+const AGENT_SHORTHANDS: Record<string, string> = {
+  general: "g",
+  coding: "c",
+  research: "r",
+  thinking: "t",
+  docs: "d",
 };
 
 export function getSystemPrompt(agentType: string): string {
@@ -82,6 +99,41 @@ export function seedDefaultAgents(
   );
   for (const a of agents) {
     insert.run(a.id, a.name, a.shorthand, a.provider, a.endpoint, a.model, a.systemPrompt, a.isDefault ? 1 : 0);
+  }
+}
+
+/**
+ * Apply agent overrides from SHELLM_AGENT_* env vars.
+ * This allows .env to be the source of truth for agent-model mapping.
+ * Updates existing agents in the DB; creates new ones if they don't exist.
+ */
+export function applyEnvAgentOverrides(): void {
+  const envConfigs = loadAgentConfigsFromEnv();
+  if (envConfigs.length === 0) return;
+
+  for (const ec of envConfigs) {
+    const existing = getAgent(ec.id);
+    if (existing) {
+      // Update model/endpoint/provider from env, keep everything else
+      upsertAgent({
+        ...existing,
+        model: ec.model,
+        endpoint: ec.endpoint,
+        provider: ec.provider,
+      });
+    } else {
+      // Create a new agent from env config
+      upsertAgent({
+        id: ec.id,
+        name: AGENT_NAMES[ec.id] || ec.id,
+        shorthand: AGENT_SHORTHANDS[ec.id] || ec.id.charAt(0),
+        provider: ec.provider,
+        endpoint: ec.endpoint,
+        model: ec.model,
+        systemPrompt: getSystemPrompt(ec.id),
+        isDefault: ec.id === "general",
+      });
+    }
   }
 }
 

@@ -6,7 +6,7 @@ import { singleQuery, interactiveChat } from "./chat";
 import { runConfigWizard } from "./tui/config";
 import { discoverAll, printDiscovery } from "./llm/discovery";
 import { enumerateEndpoints } from "./config";
-import { listAgents, getAgent } from "./agents";
+import { listAgents, getAgent, applyEnvAgentOverrides } from "./agents";
 import { listSessions } from "./sessions";
 import { closeDb } from "./db";
 import { runBenchmark } from "./benchmark";
@@ -131,10 +131,12 @@ function cmdAgents(): void {
   for (const a of agents) {
     const def = a.isDefault ? ` ${c.yellow}(default)${c.reset}` : "";
     console.log(`  ${agentBadge(a.id)}${def}`);
-    console.log(`    ${c.dim}shorthand: ${a.shorthand} | model: ${a.model}${c.reset}`);
-    console.log(`    ${c.dim}${a.provider}://${a.endpoint}${c.reset}`);
+    console.log(`    ${c.dim}shorthand:${c.reset} ${c.cyan}${a.shorthand}${c.reset}`);
+    console.log(`    ${c.dim}model:${c.reset}     ${c.bold}${a.model}${c.reset}`);
+    console.log(`    ${c.dim}endpoint:${c.reset}  ${a.endpoint} ${c.dim}(${a.provider})${c.reset}`);
     console.log();
   }
+  console.log(`${c.dim}Edit .env SHELLM_AGENT_* vars or run 'shellm config' to change.${c.reset}\n`);
 }
 
 async function cmdModels(): Promise<void> {
@@ -191,6 +193,11 @@ async function main(): Promise<void> {
   // Apply config
   const cfg = getConfig();
   setNerdFonts(cfg.nerdFonts);
+
+  // Apply agent overrides from SHELLM_AGENT_* env vars
+  if (isConfigured()) {
+    applyEnvAgentOverrides();
+  }
 
   if (parsed.version) {
     console.log(`shellm v${VERSION}`);
