@@ -1,6 +1,8 @@
 import { createInterface } from "readline";
+import { readFileSync, existsSync, createReadStream, openSync } from "fs";
+import { resolve } from "path";
 import { getDefaultAgent, getAgent } from "./agents";
-import { chatCompletion, type ChatMessage, type ChatResponse } from "./llm/client";
+import { chatCompletion, type ChatMessage, type ChatResponse, type ChatOptions } from "./llm/client";
 import {
   createSession,
   addMessage,
@@ -8,7 +10,7 @@ import {
   updateSessionTitle,
 } from "./sessions";
 import { storeMemory, getRelevantMemory, formatMemoryContext } from "./memory";
-import { getConfig } from "./config";
+import { getConfig, enumerateEndpoints } from "./config";
 import {
   c,
   g,
@@ -19,9 +21,22 @@ import {
   formatTokens,
   dimText,
   errorMsg,
+  successMsg,
   Spinner,
   agentBadge,
 } from "./format";
+
+export interface QueryOptions {
+  agent?: string;
+  verbose?: boolean;
+  modelOverride?: string;
+  systemPromptOverride?: string;
+  temperature?: number;
+  topP?: number;
+  maxTokens?: number;
+  execMode?: boolean;
+  files?: string[];
+}
 
 // Filter <think>...</think> blocks from streaming output
 function createThinkFilter() {
@@ -79,27 +94,195 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+/**
+ * Read file contents for context injection.
+ */
+function readFileContext(filePaths: string[]): string {
+  const parts: string[] = [];
+  for (const fp of filePaths) {
+    const resolved = resolve(process.cwd(), fp);
+    if (!existsSync(resolved)) {
+      console.error(errorMsg(`File not found: ${fp}`));
+      continue;
+    }
+    const content = readFileSync(resolved, "utf-8");
+    parts.push(`--- File: ${fp} ---\n${content}\n--- End: ${fp} ---`);
+  }
+  return parts.join("\n\n");
+}
+
+/**
+ * Attempt a chat completion with failover to other endpoints on connection error.
+ */
+async function chatWithFailover(
+  provider: "ollama" | "openai",
+  endpoint: string,
+  model: string,
+  messages: ChatMessage[],
+  stream: boolean,
+  callbacks?: Parameters<typeof chatCompletion>[5],
+  chatOpts?: ChatOptions,
+  verbose = false
+): Promise<ChatResponse> {
+  try {
+    return await chatCompletion(provider, endpoint, model, messages, stream, callbacks, chatOpts);
+  } catch (err: any) {
+    // Only failover on connection errors, not API errors
+    const isConnectionError = err.message?.includes("fetch") ||
+      err.message?.includes("ECONNREFUSED") ||
+      err.message?.includes("ETIMEDOUT") ||
+      err.message?.includes("NetworkError") ||
+      err.code === "ECONNREFUSED";
+
+    if (!isConnectionError) throw err;
+
+    if (verbose) {
+      console.error(dimText(`${g().cross} ${endpoint} failed, trying failover...`));
+    }
+
+    // Find alternative endpoints of the same provider type
+    const allEndpoints = enumerateEndpoints();
+    const alternatives = allEndpoints.filter(
+      (ep) => ep.type === provider && ep.url !== endpoint
+    );
+
+    for (const alt of alternatives) {
+      try {
+        if (verbose) {
+          console.error(dimText(`${g().plug} trying ${alt.url}...`));
+        }
+        return await chatCompletion(provider, alt.url, model, messages, stream, callbacks, chatOpts);
+      } catch {
+        continue;
+      }
+    }
+
+    // If same-type failover failed, try any available endpoint
+    const otherType = allEndpoints.filter(
+      (ep) => ep.type !== provider && ep.url !== endpoint
+    );
+    for (const alt of otherType) {
+      try {
+        if (verbose) {
+          console.error(dimText(`${g().plug} trying ${alt.type}://${alt.url}...`));
+        }
+        return await chatCompletion(alt.type, alt.url, model, messages, stream, callbacks, chatOpts);
+      } catch {
+        continue;
+      }
+    }
+
+    // All failed
+    throw new Error(`All endpoints failed. Original error: ${err.message}`);
+  }
+}
+
+/**
+ * Prompt user to confirm and execute a shell command.
+ * Falls back to /dev/tty for confirmation if stdin was piped.
+ */
+async function promptAndExecute(command: string): Promise<void> {
+  // Strip markdown code fences if present
+  let cmd = command.trim();
+  if (cmd.startsWith("```")) {
+    cmd = cmd.replace(/^```\w*\n?/, "").replace(/\n?```$/, "").trim();
+  }
+
+  const gl = g();
+  console.log(`\n${c.bold}${gl.terminal} Command:${c.reset}`);
+  console.log(`  ${c.cyan}${cmd}${c.reset}\n`);
+
+  // If stdin was piped, open /dev/tty for interactive confirmation
+  let input: NodeJS.ReadableStream;
+  if (process.stdin.isTTY) {
+    input = process.stdin;
+  } else {
+    try {
+      const fd = openSync("/dev/tty", "r");
+      input = createReadStream("", { fd }) as any;
+    } catch {
+      // No TTY available (e.g., in a non-interactive environment)
+      console.error(dimText("no TTY available for confirmation, skipping execution"));
+      return;
+    }
+  }
+
+  const rl = createInterface({ input, output: process.stderr });
+
+  return new Promise<void>((res) => {
+    rl.question(`${c.yellow}Execute? [y/N]${c.reset} `, (answer) => {
+      rl.close();
+      if (answer.trim().toLowerCase() === "y") {
+        console.log(dimText(`${gl.arrow} running...\n`));
+        const proc = Bun.spawnSync(["bash", "-c", cmd], {
+          stdout: "inherit",
+          stderr: "inherit",
+          cwd: process.cwd(),
+        });
+        if (proc.exitCode !== 0) {
+          console.error(errorMsg(`exit code ${proc.exitCode}`));
+        } else {
+          console.log(successMsg("done"));
+        }
+      } else {
+        console.log(dimText("skipped"));
+      }
+      res();
+    });
+  });
+}
+
 export async function singleQuery(
   question: string,
-  agentId?: string,
-  verbose = false
+  opts: QueryOptions = {}
 ): Promise<void> {
-  const agent = agentId
-    ? getAgent(agentId)
+  const agent = opts.agent
+    ? getAgent(opts.agent)
     : getDefaultAgent();
 
   if (!agent) {
-    console.error(errorMsg(`Agent "${agentId || "default"}" not found. Run: shellm config`));
+    console.error(errorMsg(`Agent "${opts.agent || "default"}" not found. Run: shellm config`));
     process.exit(1);
   }
 
   const cfg = getConfig();
   const dir = process.cwd();
+  const verbose = opts.verbose || false;
+
+  // Resolve model (CLI override > agent default)
+  const model = opts.modelOverride || agent.model;
+
+  // Resolve system prompt (CLI override > agent default)
+  const systemPrompt = opts.systemPromptOverride || agent.systemPrompt;
+
+  // Resolve API key from endpoint config
+  const endpoints = enumerateEndpoints();
+  const matchedEndpoint = endpoints.find((ep) => ep.url === agent.endpoint);
+  const apiKey = matchedEndpoint?.apiKey;
+
+  // Build chat options with sensible defaults
+  const chatOpts: ChatOptions = {
+    temperature: opts.temperature ?? 0.7,
+    topP: opts.topP ?? 0.9,
+    maxTokens: opts.maxTokens ?? 4096,
+  };
+  if (apiKey) chatOpts.apiKey = apiKey;
 
   // Build messages
   const messages: ChatMessage[] = [
-    { role: "system", content: agent.systemPrompt },
+    { role: "system", content: systemPrompt },
   ];
+
+  // Inject file context if provided
+  if (opts.files && opts.files.length > 0) {
+    const fileCtx = readFileContext(opts.files);
+    if (fileCtx) {
+      messages.push({ role: "system", content: `File context:\n\n${fileCtx}` });
+      if (verbose) {
+        console.error(dimText(`${g().doc} ${opts.files.length} file(s) loaded as context`));
+      }
+    }
+  }
 
   // Add memory context if enabled
   if (cfg.memoryEnabled) {
@@ -122,12 +305,20 @@ export async function singleQuery(
   addMessage(sessionId, "user", question, dir);
 
   if (verbose) {
+    const modelInfo = model !== agent.model ? ` (override: ${model})` : "";
     console.error(
-      dimText(`${g().plug} ${agent.provider}://${agent.endpoint} | ${agent.model}`)
+      dimText(`${g().plug} ${agent.provider}://${agent.endpoint} | ${model}${modelInfo}`)
     );
+    if (Object.keys(chatOpts).length > 0) {
+      const parts: string[] = [];
+      if (chatOpts.temperature !== undefined) parts.push(`temp=${chatOpts.temperature}`);
+      if (chatOpts.topP !== undefined) parts.push(`top_p=${chatOpts.topP}`);
+      if (chatOpts.maxTokens !== undefined) parts.push(`max_tokens=${chatOpts.maxTokens}`);
+      console.error(dimText(`${g().gear} ${parts.join(" | ")}`));
+    }
   }
 
-  // Stream response
+  // Stream response with failover
   let response: ChatResponse;
 
   if (cfg.stream) {
@@ -136,10 +327,10 @@ export async function singleQuery(
     let firstVisible = true;
     const thinkFilter = createThinkFilter();
     waitSpinner.start();
-    response = await chatCompletion(
+    response = await chatWithFailover(
       agent.provider,
       agent.endpoint,
-      agent.model,
+      model,
       messages,
       true,
       {
@@ -155,7 +346,6 @@ export async function singleQuery(
         },
         onDone: (resp) => {
           if (firstVisible) waitSpinner.stop();
-          // Estimate tokens if API didn't report them
           if (resp.tokensOut === 0 && resp.content.length > 0) {
             resp.tokensOut = estimateTokens(resp.content);
           }
@@ -168,17 +358,22 @@ export async function singleQuery(
           waitSpinner.stop();
           console.error(errorMsg(err.message));
         },
-      }
+      },
+      chatOpts,
+      verbose
     );
   } else {
     const spinner = new Spinner("thinking...");
     spinner.start();
-    response = await chatCompletion(
+    response = await chatWithFailover(
       agent.provider,
       agent.endpoint,
-      agent.model,
+      model,
       messages,
-      false
+      false,
+      undefined,
+      chatOpts,
+      verbose
     );
     spinner.stop();
     console.log(`${assistantHeader(agent.id)}\n${response.content}`);
@@ -198,16 +393,15 @@ export async function singleQuery(
     storeMemory(dir, question, response.content);
   }
 
-  // Stats line
-  if (verbose) {
-    console.error(
-      dimText(
-        `\n${g().clock} ${formatDuration(response.durationMs)} | ` +
-          `in: ${formatTokens(response.tokensIn)} | ` +
-          `out: ${formatTokens(response.tokensOut)} | ` +
-          `session: ${sessionId}`
-      )
-    );
+  // Stats line (always show timing + tokens; verbose adds session ID)
+  const statsLine = `${g().clock} ${formatDuration(response.durationMs)} | ` +
+    `in: ${formatTokens(response.tokensIn)} | out: ${formatTokens(response.tokensOut)}` +
+    (verbose ? ` | session: ${sessionId}` : "");
+  console.error(dimText(statsLine));
+
+  // Shell execution mode
+  if (opts.execMode) {
+    await promptAndExecute(response.content);
   }
 }
 

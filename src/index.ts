@@ -2,25 +2,68 @@
 
 import { loadEnvFile, getConfig, isConfigured } from "./config";
 import { setNerdFonts, c, g, banner, dimText, errorMsg, agentBadge } from "./format";
-import { singleQuery, interactiveChat } from "./chat";
+import { singleQuery, interactiveChat, type QueryOptions } from "./chat";
 import { runConfigWizard } from "./tui/config";
 import { discoverAll, printDiscovery } from "./llm/discovery";
 import { enumerateEndpoints } from "./config";
 import { listAgents, getAgent, applyEnvAgentOverrides } from "./agents";
-import { listSessions } from "./sessions";
+import { listSessions, exportSessionMarkdown } from "./sessions";
 import { closeDb } from "./db";
 import { runBenchmark } from "./benchmark";
+import { generateBashCompletion, generateZshCompletion, generateFishCompletion } from "./completion";
 
 // Load env before anything else
 loadEnvFile();
 
 const VERSION = "0.1.0";
 
+// Prompt prefixes: flags that wrap the user's query with specific instructions
+const PROMPT_PREFIXES: Record<string, { flag: string; alias: string; description: string; instruction: string }> = {
+  clean: {
+    flag: "--clean",
+    alias: "-C",
+    description: "Clean up grammar, spelling, and clarity",
+    instruction: "Clean up the grammar, punctuation, spelling, and clarity of the following text. Preserve the original meaning and intent. Output only the corrected text:",
+  },
+  cmd: {
+    flag: "--cmd",
+    alias: "-X",
+    description: "Return only a shell command, no explanation",
+    instruction: "Provide only the shell command to accomplish the following task. No explanation, no markdown code blocks, just the raw command ready to copy-paste:",
+  },
+  explain: {
+    flag: "--explain",
+    alias: "-E",
+    description: "Explain in clear, simple terms",
+    instruction: "Explain the following in clear, simple terms:",
+  },
+  summarize: {
+    flag: "--summarize",
+    alias: "-S",
+    description: "Summarize concisely",
+    instruction: "Summarize the following concisely, capturing only the key points:",
+  },
+  code: {
+    flag: "--code",
+    alias: "-K",
+    description: "Write code only, minimal comments",
+    instruction: "Write clean, working code for the following. Provide only the code with minimal comments:",
+  },
+};
+
 interface ParsedArgs {
   command: string;
   query?: string;
   agent?: string;
   session?: string;
+  prefix?: string;
+  model?: string;
+  systemPrompt?: string;
+  temperature?: number;
+  topP?: number;
+  maxTokens?: number;
+  execMode: boolean;
+  files: string[];
   verbose: boolean;
   help: boolean;
   version: boolean;
@@ -30,10 +73,19 @@ function parseArgs(argv: string[]): ParsedArgs {
   const args = argv.slice(2);
   const result: ParsedArgs = {
     command: "",
+    execMode: false,
+    files: [],
     verbose: false,
     help: false,
     version: false,
   };
+
+  // Build a lookup from flags/aliases to prefix keys
+  const prefixByFlag = new Map<string, string>();
+  for (const [key, p] of Object.entries(PROMPT_PREFIXES)) {
+    prefixByFlag.set(p.flag, key);
+    prefixByFlag.set(p.alias, key);
+  }
 
   let i = 0;
   while (i < args.length) {
@@ -54,6 +106,28 @@ function parseArgs(argv: string[]): ParsedArgs {
     } else if (arg === "-s" || arg === "--session") {
       i++;
       result.session = args[i];
+    } else if (arg === "-m" || arg === "--model") {
+      i++;
+      result.model = args[i];
+    } else if (arg === "-p" || arg === "--system-prompt") {
+      i++;
+      result.systemPrompt = args[i];
+    } else if (arg === "--temp" || arg === "--temperature") {
+      i++;
+      result.temperature = parseFloat(args[i]);
+    } else if (arg === "--top-p") {
+      i++;
+      result.topP = parseFloat(args[i]);
+    } else if (arg === "--max-tokens") {
+      i++;
+      result.maxTokens = parseInt(args[i]);
+    } else if (arg === "--exec" || arg === "--run") {
+      result.execMode = true;
+    } else if (arg === "-f" || arg === "--file") {
+      i++;
+      if (args[i]) result.files.push(args[i]);
+    } else if (prefixByFlag.has(arg)) {
+      result.prefix = prefixByFlag.get(arg)!;
     } else if (!arg.startsWith("-") && !result.command) {
       result.command = arg;
     } else if (!arg.startsWith("-") && result.command && !result.query) {
@@ -66,6 +140,41 @@ function parseArgs(argv: string[]): ParsedArgs {
   return result;
 }
 
+/**
+ * Read piped stdin (non-TTY). Returns empty string if stdin is a TTY.
+ */
+async function readPipedInput(): Promise<string> {
+  if (process.stdin.isTTY) return "";
+  // Use Bun's native stdin reader
+  const text = await Bun.stdin.text();
+  return text.trim();
+}
+
+/**
+ * Apply a prompt prefix to a query, combining piped input if present.
+ */
+function buildQuery(query: string, pipedInput: string, prefixKey?: string): string {
+  const prefix = prefixKey ? PROMPT_PREFIXES[prefixKey]?.instruction : undefined;
+
+  // Combine piped input with query argument
+  let fullInput: string;
+  if (pipedInput && query) {
+    // Both: query is the instruction context, piped input is the content
+    fullInput = `${query}\n\n${pipedInput}`;
+  } else if (pipedInput) {
+    fullInput = pipedInput;
+  } else {
+    fullInput = query;
+  }
+
+  // Apply prefix
+  if (prefix) {
+    return `${prefix}\n\n${fullInput}`;
+  }
+
+  return fullInput;
+}
+
 function printHelp(): void {
   console.log(`\n${banner()}\n`);
   console.log(`${c.bold}USAGE:${c.reset}`);
@@ -74,7 +183,9 @@ function printHelp(): void {
   console.log(`  llm -a coding -q "question"     Question to specific agent`);
   console.log(`  llm "question"                  Shorthand for -q`);
   console.log(`  llm chat                        Interactive chat mode`);
-  console.log(`  llm chat -a research            Chat with specific agent`);
+  console.log(`  echo "text" | llm               Pipe input as the query`);
+  console.log(`  cat file | llm --clean           Pipe + prefix mode`);
+  console.log(`  cat file | llm "explain this"   Pipe content with instruction`);
   console.log();
   console.log(`${c.bold}COMMANDS:${c.reset}`);
   console.log(`  chat              Interactive multi-turn chat`);
@@ -83,15 +194,30 @@ function printHelp(): void {
   console.log(`  agents            List configured agents`);
   console.log(`  models            List available models on all endpoints`);
   console.log(`  sessions          List past conversation sessions`);
+  console.log(`  export <id>       Export session to markdown`);
+  console.log(`  completion [sh]   Generate shell tab completions (bash/zsh/fish)`);
   console.log(`  benchmark         Test all models, set fastest as default`);
   console.log();
   console.log(`${c.bold}OPTIONS:${c.reset}`);
-  console.log(`  -q, --query <text>     Ask a question (single-turn)`);
-  console.log(`  -a, --agent <id>       Select agent by id or shorthand`);
-  console.log(`  -s, --session <id>     Continue a session`);
-  console.log(`  -v, --verbose          Show timing, tokens, endpoint info`);
-  console.log(`  -h, --help             Show this help`);
-  console.log(`  --version              Show version`);
+  console.log(`  -q, --query <text>       Ask a question (single-turn)`);
+  console.log(`  -a, --agent <id>         Select agent by id or shorthand`);
+  console.log(`  -m, --model <name>       Override model for this query`);
+  console.log(`  -p, --system-prompt <t>  Override system prompt`);
+  console.log(`  -f, --file <path>        Inject file as context (repeatable)`);
+  console.log(`  -s, --session <id>       Continue a session`);
+  console.log(`  --temp <0.0-2.0>         Set temperature`);
+  console.log(`  --top-p <0.0-1.0>        Set top-p (nucleus sampling)`);
+  console.log(`  --max-tokens <n>         Max response tokens`);
+  console.log(`  --exec, --run            Execute the LLM's command suggestion`);
+  console.log(`  -v, --verbose            Show timing, tokens, endpoint info`);
+  console.log(`  -h, --help               Show this help`);
+  console.log(`  --version                Show version`);
+  console.log();
+  console.log(`${c.bold}PROMPT PREFIXES:${c.reset}`);
+  for (const [, p] of Object.entries(PROMPT_PREFIXES)) {
+    const flags = `${p.alias}, ${p.flag}`;
+    console.log(`  ${c.cyan}${flags.padEnd(18)}${c.reset} ${p.description}`);
+  }
   console.log();
   console.log(`${c.bold}AGENTS:${c.reset}`);
   const agents = listAgents();
@@ -106,10 +232,28 @@ function printHelp(): void {
   console.log();
   console.log(`${c.bold}EXAMPLES:${c.reset}`);
   console.log(`  llm "how do I find files by name recursively?"`);
-  console.log(`  llm -a c -q "write a python quicksort"`);
-  console.log(`  llm -a r -q "explain TCP vs UDP" -v`);
-  console.log(`  llm chat -a research`);
-  console.log(`  llm sessions`);
+  console.log(`  llm -m qwen2.5:3b "quick question"            Model override`);
+  console.log(`  llm --cmd "docker container cpu and memory"    Shell command`);
+  console.log(`  llm --cmd --exec "find large files over 1GB"   Suggest + execute`);
+  console.log();
+  console.log(`  ${c.dim}# Clean up a messy text message or prompt:${c.reset}`);
+  console.log(`  llm --clean "i need u to pls fix the auth bug its broke again thx"`);
+  console.log(`  ${c.dim}#=> "Please fix the authentication bug -- it's broken again. Thanks."${c.reset}`);
+  console.log();
+  console.log(`  echo "teh quik brwn fox" | llm --clean         Fix grammar`);
+  console.log(`  cat README.md | llm --summarize                Summarize file`);
+  console.log(`  cat error.log | llm "what went wrong?"         Pipe + question`);
+  console.log(`  git diff | llm "write a commit message"        Pipe diff`);
+  console.log(`  llm -f src/main.ts "what does this do?"        File context`);
+  console.log(`  llm -f a.ts -f b.ts "compare these"            Multiple files`);
+  console.log(`  llm --temp 0 "deterministic answer"            Low temperature`);
+  console.log(`  llm export abc123 > session.md                 Export session`);
+  console.log(`  llm chat -a research                           Interactive chat`);
+  console.log();
+  console.log(`${c.bold}TAB COMPLETION:${c.reset}`);
+  console.log(`  eval "$(llm completion bash)"    ${c.dim}# add to ~/.bashrc${c.reset}`);
+  console.log(`  eval "$(llm completion zsh)"     ${c.dim}# add to ~/.zshrc${c.reset}`);
+  console.log(`  llm completion fish > ~/.config/fish/completions/llm.fish`);
   console.log();
 }
 
@@ -186,6 +330,48 @@ function cmdSessions(): void {
   console.log(dimText(`Resume with: llm chat -s <session_id>\n`));
 }
 
+function cmdCompletion(shell?: string): void {
+  switch (shell) {
+    case "bash":
+      process.stdout.write(generateBashCompletion());
+      break;
+    case "zsh":
+      process.stdout.write(generateZshCompletion());
+      break;
+    case "fish":
+      process.stdout.write(generateFishCompletion());
+      break;
+    default:
+      // Auto-detect shell
+      const parentShell = process.env.SHELL || "";
+      if (parentShell.includes("zsh")) {
+        process.stdout.write(generateZshCompletion());
+      } else if (parentShell.includes("fish")) {
+        process.stdout.write(generateFishCompletion());
+      } else {
+        process.stdout.write(generateBashCompletion());
+      }
+      break;
+  }
+}
+
+function cmdExport(sessionId?: string): void {
+  if (!sessionId) {
+    console.error(errorMsg("Usage: llm export <session_id>"));
+    console.error(dimText("Run 'llm sessions' to see available session IDs."));
+    return;
+  }
+
+  const md = exportSessionMarkdown(sessionId);
+  if (!md) {
+    console.error(errorMsg(`Session "${sessionId}" not found or has no messages.`));
+    return;
+  }
+
+  // Output to stdout (can be redirected to file)
+  process.stdout.write(md);
+}
+
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv);
 
@@ -215,47 +401,82 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // Route commands
-  switch (parsed.command) {
-    case "config":
-      await runConfigWizard(!isConfigured());
-      break;
+  // Read piped stdin if available (non-TTY)
+  const pipedInput = await readPipedInput();
 
-    case "chat":
-      await interactiveChat(parsed.agent, parsed.session);
-      break;
+  // Route commands (only when no piped input, or when command is explicit)
+  const explicitCommands = ["config", "chat", "discover", "agents", "models", "sessions", "export", "benchmark", "completion"];
+  if (!pipedInput || explicitCommands.includes(parsed.command)) {
+    switch (parsed.command) {
+      case "config":
+        await runConfigWizard(!isConfigured());
+        closeDb();
+        return;
 
-    case "discover":
-      await cmdDiscover();
-      break;
+      case "chat":
+        await interactiveChat(parsed.agent, parsed.session);
+        closeDb();
+        return;
 
-    case "agents":
-      cmdAgents();
-      break;
+      case "discover":
+        await cmdDiscover();
+        closeDb();
+        return;
 
-    case "models":
-      await cmdModels();
-      break;
+      case "agents":
+        cmdAgents();
+        closeDb();
+        return;
 
-    case "sessions":
-      cmdSessions();
-      break;
+      case "models":
+        await cmdModels();
+        closeDb();
+        return;
 
-    case "benchmark":
-      await runBenchmark();
-      break;
+      case "sessions":
+        cmdSessions();
+        closeDb();
+        return;
 
-    default:
-      // Query mode: either -q flag or bare argument
-      if (parsed.query) {
-        await singleQuery(parsed.query, parsed.agent, parsed.verbose);
-      } else if (parsed.command && !parsed.command.startsWith("-")) {
-        // Treat the command itself as a query if it doesn't match a known command
-        await singleQuery(parsed.command, parsed.agent, parsed.verbose);
-      } else {
-        printHelp();
-      }
-      break;
+      case "export":
+        cmdExport(parsed.query);
+        closeDb();
+        return;
+
+      case "completion":
+        cmdCompletion(parsed.query);
+        closeDb();
+        return;
+
+      case "benchmark":
+        await runBenchmark();
+        closeDb();
+        return;
+    }
+  }
+
+  // Query mode: combine piped input, CLI query, and prefix
+  const rawQuery = parsed.query || (parsed.command && !parsed.command.startsWith("-") ? parsed.command : "");
+  const finalQuery = buildQuery(rawQuery, pipedInput, parsed.prefix);
+
+  if (finalQuery) {
+    // If --cmd prefix is used with --exec, auto-enable exec mode
+    const execMode = parsed.execMode || (parsed.prefix === "cmd" && parsed.execMode);
+
+    const opts: QueryOptions = {
+      agent: parsed.agent,
+      verbose: parsed.verbose,
+      modelOverride: parsed.model,
+      systemPromptOverride: parsed.systemPrompt,
+      temperature: parsed.temperature,
+      topP: parsed.topP,
+      maxTokens: parsed.maxTokens,
+      execMode,
+      files: parsed.files.length > 0 ? parsed.files : undefined,
+    };
+    await singleQuery(finalQuery, opts);
+  } else {
+    printHelp();
   }
 
   closeDb();

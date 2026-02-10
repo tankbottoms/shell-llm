@@ -115,3 +115,69 @@ export function updateSessionTitle(id: string, title: string): void {
   const db = getDb();
   db.prepare("UPDATE sessions SET title = ? WHERE id = ?").run(title, id);
 }
+
+export interface DetailedMessage {
+  role: string;
+  content: string;
+  tokensIn: number;
+  tokensOut: number;
+  durationMs: number;
+  createdAt: string;
+}
+
+export function getSessionMessagesDetailed(sessionId: string): DetailedMessage[] {
+  const db = getDb();
+  const rows = db
+    .query(
+      "SELECT role, content, tokens_in, tokens_out, duration_ms, created_at FROM messages WHERE session_id = ? ORDER BY id"
+    )
+    .all(sessionId) as any[];
+  return rows.map((r) => ({
+    role: r.role,
+    content: r.content,
+    tokensIn: r.tokens_in || 0,
+    tokensOut: r.tokens_out || 0,
+    durationMs: r.duration_ms || 0,
+    createdAt: r.created_at,
+  }));
+}
+
+export function exportSessionMarkdown(sessionId: string): string | null {
+  const session = getSession(sessionId);
+  if (!session) return null;
+
+  const messages = getSessionMessagesDetailed(sessionId);
+  if (messages.length === 0) return null;
+
+  const lines: string[] = [];
+  lines.push(`# ${session.title || "Untitled Session"}`);
+  lines.push("");
+  lines.push(`- **Session:** ${session.id}`);
+  lines.push(`- **Agent:** ${session.agentId}`);
+  lines.push(`- **Directory:** ${session.directory}`);
+  lines.push(`- **Created:** ${session.createdAt}`);
+  lines.push(`- **Updated:** ${session.updatedAt}`);
+  lines.push("");
+  lines.push("---");
+  lines.push("");
+
+  for (const msg of messages) {
+    if (msg.role === "system") continue;
+
+    if (msg.role === "user") {
+      lines.push(`## User`);
+    } else {
+      lines.push(`## Assistant`);
+    }
+    lines.push("");
+    lines.push(msg.content);
+    lines.push("");
+
+    if (msg.role === "assistant" && (msg.tokensIn || msg.tokensOut)) {
+      lines.push(`> *${msg.durationMs}ms | in: ${msg.tokensIn} | out: ${msg.tokensOut}*`);
+      lines.push("");
+    }
+  }
+
+  return lines.join("\n");
+}

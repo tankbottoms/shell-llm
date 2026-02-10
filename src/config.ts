@@ -8,6 +8,7 @@ export interface Endpoint {
   port: number;
   url: string;
   name: string;
+  apiKey?: string;
   available?: boolean;
   models?: string[];
 }
@@ -99,6 +100,77 @@ export function enumerateEndpoints(): Endpoint[] {
       url: url.replace(/\/$/, ""),
       name: `openai-${suffix} (${host}:${port})`,
     });
+  }
+
+  // API-key based OpenAI-compatible endpoints
+  // Gemini (OpenAI-compatible mode)
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (geminiKey) {
+    endpoints.push({
+      type: "openai",
+      host: "generativelanguage.googleapis.com",
+      port: 443,
+      url: "https://generativelanguage.googleapis.com/v1beta/openai",
+      name: "gemini",
+      apiKey: geminiKey,
+    });
+  }
+
+  // OpenRouter
+  const openrouterKey = process.env.OPENROUTER_API_KEY;
+  if (openrouterKey) {
+    endpoints.push({
+      type: "openai",
+      host: "openrouter.ai",
+      port: 443,
+      url: "https://openrouter.ai/api/v1",
+      name: "openrouter",
+      apiKey: openrouterKey,
+    });
+  }
+
+  // Mistral
+  const mistralKey = process.env.MISTRAL_API_KEY;
+  if (mistralKey) {
+    endpoints.push({
+      type: "openai",
+      host: "api.mistral.ai",
+      port: 443,
+      url: "https://api.mistral.ai",
+      name: "mistral",
+      apiKey: mistralKey,
+    });
+  }
+
+  // DeepSeek
+  const deepseekKey = process.env.DEEPSEEK_API_KEY;
+  if (deepseekKey) {
+    endpoints.push({
+      type: "openai",
+      host: "api.deepseek.com",
+      port: 443,
+      url: "https://api.deepseek.com",
+      name: "deepseek",
+      apiKey: deepseekKey,
+    });
+  }
+
+  // Generic: any SHELLM_API_KEY_XX / SHELLM_API_URL_XX pairs
+  for (let i = 0; i < 10; i++) {
+    const suffix = String(i).padStart(2, "0");
+    const key = process.env[`SHELLM_API_KEY_${suffix}`];
+    const url = process.env[`SHELLM_API_URL_${suffix}`];
+    const name = process.env[`SHELLM_API_NAME_${suffix}`] || `api-${suffix}`;
+    if (key && url) {
+      endpoints.push({
+        type: "openai",
+        host: new URL(url).hostname,
+        port: parseInt(new URL(url).port || "443"),
+        url: url.replace(/\/$/, ""),
+        name,
+        apiKey: key,
+      });
+    }
   }
 
   // Fallback: if no endpoints configured, add local ollama

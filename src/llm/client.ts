@@ -11,6 +11,13 @@ export interface ChatResponse {
   model: string;
 }
 
+export interface ChatOptions {
+  temperature?: number;
+  topP?: number;
+  maxTokens?: number;
+  apiKey?: string;
+}
+
 export interface StreamCallbacks {
   onToken: (token: string) => void;
   onDone: (response: ChatResponse) => void;
@@ -23,12 +30,13 @@ export async function chatCompletion(
   model: string,
   messages: ChatMessage[],
   stream: boolean = true,
-  callbacks?: StreamCallbacks
+  callbacks?: StreamCallbacks,
+  options?: ChatOptions
 ): Promise<ChatResponse> {
   if (provider === "ollama") {
-    return ollamaChat(endpoint, model, messages, stream, callbacks);
+    return ollamaChat(endpoint, model, messages, stream, callbacks, options);
   }
-  return openaiChat(endpoint, model, messages, stream, callbacks);
+  return openaiChat(endpoint, model, messages, stream, callbacks, options);
 }
 
 async function ollamaChat(
@@ -36,15 +44,24 @@ async function ollamaChat(
   model: string,
   messages: ChatMessage[],
   stream: boolean,
-  callbacks?: StreamCallbacks
+  callbacks?: StreamCallbacks,
+  options?: ChatOptions
 ): Promise<ChatResponse> {
   const url = `${endpoint}/api/chat`;
   const start = Date.now();
 
+  const body: any = { model, messages, stream };
+  if (options?.temperature !== undefined || options?.topP !== undefined) {
+    body.options = {};
+    if (options.temperature !== undefined) body.options.temperature = options.temperature;
+    if (options.topP !== undefined) body.options.top_p = options.topP;
+  }
+  if (options?.maxTokens !== undefined) body.options = { ...body.options, num_predict: options.maxTokens };
+
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages, stream }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
@@ -113,15 +130,25 @@ async function openaiChat(
   model: string,
   messages: ChatMessage[],
   stream: boolean,
-  callbacks?: StreamCallbacks
+  callbacks?: StreamCallbacks,
+  options?: ChatOptions
 ): Promise<ChatResponse> {
   const url = `${endpoint}/v1/chat/completions`;
   const start = Date.now();
 
+  const body: any = { model, messages, stream, max_tokens: options?.maxTokens || 4096 };
+  if (options?.temperature !== undefined) body.temperature = options.temperature;
+  if (options?.topP !== undefined) body.top_p = options.topP;
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (options?.apiKey) {
+    headers["Authorization"] = `Bearer ${options.apiKey}`;
+  }
+
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages, stream, max_tokens: 4096 }),
+    headers,
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
