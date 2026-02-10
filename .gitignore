@@ -7,3 +7,6 @@ dist/
 .claude
 .github-commit-messages
 .omc/
+llm
+llm-linux
+llm-macos
